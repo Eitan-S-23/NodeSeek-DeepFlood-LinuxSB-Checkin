@@ -645,6 +645,13 @@ def browser_sign_in(creds):
         # cookie，签到页也不再渲染 _csrf 隐藏字段——而签到 POST 校验的正是
         # 本会话的 CSRF 令牌。这里存下来，留给签到 fetch 复用。
         login_csrf = _js_fill_login_form(driver, creds, answer)
+
+        # 提交前模拟真人输入节奏：服务端有「提交过快」风控（实测 toast 提示
+        # 「提交过快，请等待验证码加载后再试」，页面加载后约 1 秒内提交即被拒，
+        # 提交被拒会整页回到 /login 且表单清空）。真人从打开页面到点登录至少
+        # 需要读题、输入三组字段的数秒到十几秒，这里随机停 8-16 秒再提交
+        stage.set("等待提交（模拟真人输入节奏）")
+        time.sleep(random.randint(8, 16))
         _js_submit_login_form(driver)
         # 登录成功的可靠特征：登录表单（password 输入框）从页面消失。
         # 该站登录表单只在 /login 呈现，登录成功后其他页面不再有密码输入框；

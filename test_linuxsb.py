@@ -932,13 +932,15 @@ class BrowserSignInJsFormTestCase(unittest.TestCase):
 
     def _run_login(self, **driver_kwargs):
         driver = FakeDriver(LOGIN_PAGE, **driver_kwargs)
-        with mock.patch.object(daily, "create_driver", return_value=driver):
+        # 屏蔽提交前模拟真人节奏的 8-16 秒随机等待（避免单测真实 sleep）
+        with mock.patch.object(daily, "create_driver", return_value=driver), \
+             mock.patch.object(daily.time, "sleep") as sleep_mock:
             result = daily.browser_sign_in(dict(self.CREDS))
-        return driver, result
+        return driver, result, sleep_mock
 
     def test_js填写凭据与验证码答案并提交(self):
         """题面解析结果随凭据一起经 arguments 传入填表脚本，提交用 requestSubmit"""
-        driver, (ok, summary, username) = self._run_login(
+        driver, (ok, summary, username), sleep_mock = self._run_login(
             captcha_question="9 × 7 = ?", login_csrf="logincsrf",
             after_login_page=BROWSER_PAGE_CHECKED,
         )
@@ -946,6 +948,8 @@ class BrowserSignInJsFormTestCase(unittest.TestCase):
         # 填表参数 = (username, password, 验证码答案)，蜜罐字段不在其中
         self.assertEqual(driver.fill_calls, [("u", "p", "63")])
         self.assertTrue(driver.submitted)
+        # 提交前必须先按真人节奏等待（服务端有「提交过快」风控）
+        self.assertTrue(any(call.args[0] >= 8 for call in sleep_mock.call_args_list))
         self.assertIn("今日已签到", summary)
         self.assertEqual(username, "烧饼爱好者")
 
@@ -958,7 +962,7 @@ class BrowserSignInJsFormTestCase(unittest.TestCase):
 
     def test_填表取不到csrf时按页面改版上报(self):
         """_csrf 为空说明登录表单结构已变，必须失败而不是带着空令牌继续"""
-        with self.assertRaisesRegex(RuntimeError, "_csrf"):
+        with self.assertRaisesRegex(RuntimeError, "结构校验失败"):
             self._run_login(captcha_question="9 × 7 = ?", login_csrf="")
 
     def test_提交后停留登录页时超时失败(self):
@@ -978,10 +982,11 @@ class BrowserSignInJsFormTestCase(unittest.TestCase):
                 raise TimeoutException()
 
         with mock.patch.object(daily, "create_driver", return_value=driver), \
+             mock.patch.object(daily.time, "sleep"), \
              mock.patch("selenium.webdriver.support.ui.WebDriverWait",
                         InstantTimeoutWait):
             with self.assertRaisesRegex(RuntimeError,
-                                        r"填写登录表单.*linux\.sb/login"):
+                                        r"等待提交（模拟真人输入节奏）.*linux\.sb/login"):
                 daily.browser_sign_in(dict(self.CREDS))
         self.assertTrue(driver.submitted)
 
