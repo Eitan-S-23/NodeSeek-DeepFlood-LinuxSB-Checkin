@@ -5,6 +5,7 @@ linuxsb_daily 只依赖 requests 与 notify，这里用 mock 替换网络请求�
 使签到判断与多账号流程可以脱离真实站点独立验证。
 """
 import os
+import re
 import unittest
 from unittest import mock
 
@@ -728,7 +729,8 @@ class FakeDriver:
     """
 
     def __init__(self, page, cookies=None, script_result=None, landing=None,
-                 title="每日签到 - 烧饼社区"):
+                 title="每日签到 - 烧饼社区", captcha_question=None,
+                 login_csrf=None, after_login_page=None):
         self.page = page
         self._cookies = cookies or []
         self.script_result = script_result
@@ -738,12 +740,21 @@ class FakeDriver:
         self.dom_queries = []      # wait_dom_ready 的调用记录
         self.async_scripts = []    # 签到 fetch 的调用记录
         self.refreshed = 0
+        # 登录表单 JS 填写流程（execute_script 三类脚本）的配置与记录
+        self.captcha_question = captcha_question  # 读题面脚本的返回值
+        self.login_csrf = login_csrf              # 填表脚本返回的 _csrf
+        self.after_login_page = after_login_page  # 提交后切换到的页面（模拟登录成功）
+        self.fill_calls = []                      # (username, password, answer) 记录
+        self.submitted = False
 
     def get(self, url):
         self.current_url = self.landing or url
 
     def refresh(self):
         self.refreshed += 1
+
+    def quit(self):
+        pass
 
     @property
     def page_source(self):
@@ -756,11 +767,37 @@ class FakeDriver:
         return self._cookies
 
     def execute_script(self, script, *args):
-        # 只服务 wait_dom_ready 的 querySelector 探测：按类名是否出现在 HTML 判定
+        # 登录流程的取值/填表/提交脚本按内容特征分派；其余调用视为
+        # wait_dom_ready 的 querySelector 探测（按选择器是否命中 HTML 判定）
+        if "native-captcha-question" in script and "textContent" in script:
+            return self.captcha_question or ""
+        if "dispatchEvent" in script:
+            self.fill_calls.append(args)
+            return self.login_csrf
+        if "requestSubmit" in script:
+            self.submitted = True
+            if self.after_login_page is not None:
+                self.page = self.after_login_page
+            return True
         selector = args[0] if args else ""
         self.dom_queries.append(selector)
-        return any(cls.strip().lstrip(".") in self.page
-                   for cls in selector.split(","))
+        return self._selector_hit(selector)
+
+    def _selector_hit(self, selector):
+        """
+        模拟 querySelector 对页面的命中判断，支持两种选择器形式：
+        .class（类名出现在 HTML）与 [name=xxx]（对应属性存在于 HTML）。
+        """
+        for part in selector.split(","):
+            part = part.strip()
+            name_match = re.fullmatch(r"\[name=([\w-]+)\]", part)
+            if name_match:
+                name = name_match.group(1)
+                if f'name="{name}"' in self.page or f"name={name}" in self.page:
+                    return True
+            elif part.startswith(".") and part.lstrip(".") in self.page:
+                return True
+        return False
 
     def execute_async_script(self, script, *args):
         self.async_scripts.append(args)
@@ -777,6 +814,20 @@ BROWSER_PAGE_UNCHECKED = (
 # 登录态签到页（已签到）
 BROWSER_PAGE_CHECKED = BROWSER_PAGE_UNCHECKED.replace(
     '<button>每日签到</button>', '<span>今日已签到</span>'
+)
+# 登录页（结构与站点 v8.7.5 快照一致：表单含 csrf/凭据/验证码/PoW 与蜜罐字段）
+LOGIN_PAGE = (
+    '<html><head><title>登录 - 烧饼社区</title></head><body>'
+    '<form method="post" data-slot="login.form_extra">'
+    '<input type="hidden" name="_csrf" value="logincsrf">'
+    '<input name="username" type="text" value="">'
+    '<input name="password" type="password">'
+    '<div class="user-review-native-captcha" data-native-captcha="">'
+    '<div class="native-captcha-question">9 × 7 = ?</div>'
+    '<input class="native-captcha-answer" name="native_captcha_answer" type="text">'
+    '<input type="hidden" name="native_captcha_pow" value="97d">'
+    '<input type="text" name="native_captcha_company" tabindex="-1">'
+    '</div><button>登录</button></form></body></html>'
 )
 
 
@@ -872,6 +923,67 @@ class CheckinInBrowserTestCase(unittest.TestCase):
         with mock.patch.object(daily.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, r"\[name=username\]"):
                 daily.wait_dom_ready(driver, "[name=username]", timeout=1)
+
+
+class BrowserSignInJsFormTestCase(unittest.TestCase):
+    """账号密码浏览器登录测试：表单读写全部经 execute_script（绕开 UCD 元素 API）"""
+
+    CREDS = {"username": "u", "password": "p"}
+
+    def _run_login(self, **driver_kwargs):
+        driver = FakeDriver(LOGIN_PAGE, **driver_kwargs)
+        with mock.patch.object(daily, "create_driver", return_value=driver):
+            result = daily.browser_sign_in(dict(self.CREDS))
+        return driver, result
+
+    def test_js填写凭据与验证码答案并提交(self):
+        """题面解析结果随凭据一起经 arguments 传入填表脚本，提交用 requestSubmit"""
+        driver, (ok, summary, username) = self._run_login(
+            captcha_question="9 × 7 = ?", login_csrf="logincsrf",
+            after_login_page=BROWSER_PAGE_CHECKED,
+        )
+        self.assertTrue(ok)
+        # 填表参数 = (username, password, 验证码答案)，蜜罐字段不在其中
+        self.assertEqual(driver.fill_calls, [("u", "p", "63")])
+        self.assertTrue(driver.submitted)
+        self.assertIn("今日已签到", summary)
+        self.assertEqual(username, "烧饼爱好者")
+
+    def test_题面取不到时按解析失败上报(self):
+        """题面为空（模板改版）时 solve_captcha_question 抛错，失败信息带阶段与 URL"""
+        with self.assertRaisesRegex(RuntimeError, r"填写登录表单.*linux\.sb/login"):
+            self._run_login(captcha_question="", login_csrf="logincsrf")
+        with self.assertRaisesRegex(RuntimeError, r"填写登录表单"):
+            self._run_login(captcha_question="请输入验证码", login_csrf="logincsrf")
+
+    def test_填表取不到csrf时按页面改版上报(self):
+        """_csrf 为空说明登录表单结构已变，必须失败而不是带着空令牌继续"""
+        with self.assertRaisesRegex(RuntimeError, "_csrf"):
+            self._run_login(captcha_question="9 × 7 = ?", login_csrf="")
+
+    def test_提交后停留登录页时超时失败(self):
+        """登录失败（如密码错误）会停在 /login：等待超时后异常带阶段与 URL"""
+        driver = FakeDriver(LOGIN_PAGE, captcha_question="9 × 7 = ?",
+                            login_csrf="logincsrf")
+        # after_login_page 不设置：提交后页面仍是登录页（password 字段一直在）
+
+        class InstantTimeoutWait:
+            """跳过真实轮询，直接抛与 selenium 一致的 TimeoutException"""
+
+            def __init__(self, driver, timeout):
+                pass
+
+            def until(self, method, message=""):
+                from selenium.common.exceptions import TimeoutException
+                raise TimeoutException()
+
+        with mock.patch.object(daily, "create_driver", return_value=driver), \
+             mock.patch("selenium.webdriver.support.ui.WebDriverWait",
+                        InstantTimeoutWait):
+            with self.assertRaisesRegex(RuntimeError,
+                                        r"填写登录表单.*linux\.sb/login"):
+                daily.browser_sign_in(dict(self.CREDS))
+        self.assertTrue(driver.submitted)
 
 
 class RunTestCase(unittest.TestCase):

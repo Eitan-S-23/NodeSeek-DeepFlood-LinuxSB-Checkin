@@ -538,6 +538,75 @@ def browser_sign_in_with_cookie(cookie):
             pass
 
 
+def _js_read_captcha_question(driver):
+    """
+    用 execute_script 读登录页算术题题面文本，取不到返回空串。
+
+    Chrome 151 + undetected-chromedriver 3.5.5 组合下 find_element / send_keys
+    会抛空 Message 的 WebDriverException（2026-08-27 起 Actions 连续失败、页面
+    快照显示表单从未被填写），而 execute_script 通道完全可用（wait_dom_ready、
+    签到 fetch 均依赖它且长期稳定）。登录表单的所有读写与提交因此全部走 JS。
+    """
+    return driver.execute_script(
+        "return (document.querySelector('.native-captcha-question') || {}).textContent || '';"
+    )
+
+
+def _js_fill_login_form(driver, creds, answer):
+    """
+    在页面内完成登录表单填写，返回表单的 _csrf（供签到复用），失败抛 RuntimeError。
+
+    值经 arguments 参数传入脚本（不拼接字符串），引号等特殊字符天然安全；
+    赋值后派发 input/change 事件，兼容依赖事件的前端逻辑。蜜罐字段
+    native_captcha_company 保持不动（伪装真人必须留空）。登录表单从密码输入框
+    定位（ancestor form），避免误碰页面其他表单。
+    """
+    filled = driver.execute_script(
+        "const password = document.querySelector('form input[name=password]');"
+        "if (!password) return null;"
+        "const form = password.closest('form');"
+        "const username = form.querySelector('input[name=username]');"
+        "const captcha = form.querySelector('input[name=native_captcha_answer]');"
+        "const csrf = form.querySelector('input[name=_csrf]');"
+        "if (!username || !captcha || !csrf) return null;"
+        "const set = (el, value) => {"
+        "  el.value = value;"
+        "  el.dispatchEvent(new Event('input', {bubbles: true}));"
+        "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+        "};"
+        "set(username, arguments[0]);"
+        "set(password, arguments[1]);"
+        "set(captcha, arguments[2]);"
+        "return csrf.value;",
+        creds["username"], creds["password"], answer,
+    )
+    if not filled:
+        raise RuntimeError(
+            "登录表单结构校验失败（缺 username/password/验证码/_csrf 之一，"
+            "页面可能已改版）"
+        )
+    return filled
+
+
+def _js_submit_login_form(driver):
+    """
+    触发登录表单提交。
+
+    用 requestSubmit（触发站点 submit 拦截器：PoW 已由页面 JS 算好时设
+    data-native-captcha-ready 后放行，与真人点按钮完全同路径）；老浏览器无
+    requestSubmit 时退回 form.submit()（PoW 值已在隐藏字段里，服务端按
+    token 校验，同样可通过）。
+    """
+    driver.execute_script(
+        "const password = document.querySelector('form input[name=password]');"
+        "const form = password && password.closest('form');"
+        "if (!form) return false;"
+        "if (form.requestSubmit) form.requestSubmit();"
+        "else form.submit();"
+        "return true;"
+    )
+
+
 def browser_sign_in(creds):
     """
     账号密码兜底登录并就地签到，返回 (成功与否, 结果摘要, 用户名或 None)。
@@ -546,10 +615,12 @@ def browser_sign_in(creds):
     签到页，并用页面内 fetch 发起签到 POST——不经过 cookie 导出/拼接/重发
     环节，登录态天然一致（此前多次尝试 cookie 导出到 requests 均无法复现
     登录态，故放弃该路线）。算术题验证码由脚本解析填写，PoW 由页面 JS 计算。
-    浏览器库（selenium/undetected_chromedriver 等）函数内局部导入，保证未
-    安装浏览器依赖时纯 requests 签到仍可正常使用。
+
+    表单的读题面/填写/提交全部用 execute_script 完成（见 _js_read_captcha_question
+    的说明：元素 API 在 Chrome 151 + UCD 3.5.5 下不可用）。浏览器库（selenium/
+    undetected_chromedriver 等）函数内局部导入，保证未安装浏览器依赖时纯
+    requests 签到仍可正常使用。
     """
-    from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
 
     driver = create_driver()
@@ -563,39 +634,18 @@ def browser_sign_in(creds):
         wait = WebDriverWait(driver, 30)
 
         stage.set("填写登录表单")
+        # 登录表单与验证码控件就绪后再取题面：PoW（页面 JS 自动算）与 DOM
+        # 渲染都完成时题面才是最终题，避免读到半渲染状态
         wait_dom_ready(driver, "[name=username]")
-        username_input = driver.find_element(By.NAME, "username")
-        username_input.clear()
-        username_input.send_keys(creds["username"])
-        password_input = driver.find_element(By.NAME, "password")
-        password_input.clear()
-        password_input.send_keys(creds["password"])
-
-        # 读取算术题题面并填入计算结果（例如「9 × 4 = ?」-> 36）
-        # 同样用 DOM 轮询（见 wait_dom_ready 的理由），避免 UCD 可见性判定坑
         wait_dom_ready(driver, ".native-captcha-question")
-        question_el = driver.find_element(By.CLASS_NAME, "native-captcha-question")
-        answer = solve_captcha_question(question_el.text)
-        wait_dom_ready(driver, "[name=native_captcha_answer]")
-        answer_input = driver.find_element(By.NAME, "native_captcha_answer")
-        answer_input.clear()
-        answer_input.send_keys(answer)
+        question = _js_read_captcha_question(driver)
+        answer = solve_captcha_question(question)
 
-        # 蜜罐字段 native_captcha_company 保持为空（伪装真人必须留空）
-        # 提交按钮必须从密码输入框所在的登录表单内找：登录页顶部还有
-        # .search-form（搜索框，action=/index.php），用全局 form button
-        # 选择器会匹配到搜索按钮——曾因此点击了搜索而非登录，跳到空搜索页
-        # （index.php?field=title&q=）且被误判为登录成功
-        login_form = password_input.find_element(By.XPATH, "ancestor::form[1]")
-        # 登录前记住登录表单的 _csrf：登录成功后服务端会删除 bbs_csrf cookie，
-        # 签到页也不再渲染 _csrf 隐藏字段——而签到 POST 校验的正是本会话的 CSRF
-        # 令牌（与 Cookie 路径一致：sign_in_account 用 bbs_csrf cookie 值即本会话
-        # CSRF）。所以这里把登录时的 _csrf 存下来，留给签到 fetch 复用。
-        login_csrf = login_form.find_element(By.NAME, "_csrf").get_attribute("value")
-        if not login_csrf:
-            raise RuntimeError("登录表单未取到 _csrf，无法为签到准备 CSRF 令牌")
-        submit = login_form.find_element(By.CSS_SELECTOR, "button[type=submit], button")
-        submit.click()
+        # 填表脚本顺带取回登录表单的 _csrf：登录成功后服务端会删除 bbs_csrf
+        # cookie，签到页也不再渲染 _csrf 隐藏字段——而签到 POST 校验的正是
+        # 本会话的 CSRF 令牌。这里存下来，留给签到 fetch 复用。
+        login_csrf = _js_fill_login_form(driver, creds, answer)
+        _js_submit_login_form(driver)
         # 登录成功的可靠特征：登录表单（password 输入框）从页面消失。
         # 该站登录表单只在 /login 呈现，登录成功后其他页面不再有密码输入框；
         # 登录失败停留在 /login（表单恒在）会在此超时并明确报错
@@ -619,10 +669,11 @@ def browser_sign_in(creds):
             pass
 
 
-# 浏览器登录偶发卡死时的最大重试次数。undetected-chromedriver 在 Actions runner
-# 无头/有头环境偶发导航后 find_element 卡到超时（曾完整成功过一次，证明链路
-# 本身可行，只是稳定性受 runner 影响）。卡死时 driver.quit 重开浏览器重试，
-# 最多 2 次仍失败才放弃，避免单次偶发抽风让整天签到失败。
+# 浏览器登录偶发失败时的最大重试次数。runner 的 Chrome 大版本升级后
+# undetected-chromedriver 可能与之不兼容（如 Chrome 151 + UCD 3.5.5 元素 API
+# 抛空 Message 异常，已通过把表单读写全部改走 execute_script 规避）；环境性
+# 抽风（导航卡死、过盾超时）仍偶有发生，重开浏览器重试可恢复，最多 2 次仍
+# 失败才放弃，避免单次偶发抽风让整天签到失败。
 _BROWSER_LOGIN_MAX_ATTEMPTS = 2
 
 
@@ -1068,8 +1119,8 @@ def run():
                 # 纯 requests 复刻登录已证实走不通——服务端的 native_captcha_answer
                 # 校验依赖只在服务端持有的哈希盐/算法（token 里 answer 是预签哈希，
                 # 与明文答案 sha256 对不上，bbs1 后端未开源），离线无法复刻。
-                # 浏览器路径曾完整成功过一次（登录+签到+积分全拿到），只是
-                # undetected-chromedriver 在 runner 偶发导航卡死，故加重试兜底。
+                # 浏览器路径的表单读写已全部改走 execute_script（Chrome 151 +
+                # UCD 3.5.5 的元素 API 不可用），环境抽风由重开浏览器重试兜底。
                 # 凭据登录最多补一次，多账号同时失效时只救第一个。
                 print("[linux.sb] Cookie 失效，使用账号密码浏览器登录并签到")
                 success, summary, username = browser_sign_in_with_retry(creds)
