@@ -179,11 +179,6 @@ class Site:
         self.base = f"https://www.{domain}"
 
     @property
-    def cookie_domain(self):
-        # 注入 cookie 时用的 domain，带前导点以覆盖子域
-        return f".{self.domain}"
-
-    @property
     def home_url(self):
         return self.base
 
@@ -538,10 +533,13 @@ def inject_site_cookies(driver, site):
         injected = 0
         for name, value in pairs:
             try:
+                # 不传 domain：Chrome 151 的 chromedriver 会拒绝显式
+                # domain（invalid cookie domain，2026-08-30 linux.sb 通道实测
+                # 全部注入失败）；省略后由 chromedriver 按当前页面 host 自动
+                # 落域（当前已 get(site.home_url)），效果相同且跨版本稳定
                 driver.add_cookie({
                     'name': name,
                     'value': value,
-                    'domain': site.cookie_domain,
                     'path': '/'
                 })
                 injected += 1

@@ -746,9 +746,16 @@ class FakeDriver:
         self.after_login_page = after_login_page  # 提交后切换到的页面（模拟登录成功）
         self.fill_calls = []                      # (username, password, answer) 记录
         self.submitted = False
+        self.added_cookies = []                   # add_cookie 的调用记录
+        self.get_calls = []                       # get() 的目标 URL 记录
 
     def get(self, url):
+        self.get_calls.append(url)
         self.current_url = self.landing or url
+
+    def add_cookie(self, cookie):
+        # 模拟 chromedriver：不带 domain 时按当前页面 host 落域（这里只记录调用）
+        self.added_cookies.append(cookie)
 
     def refresh(self):
         self.refreshed += 1
@@ -989,6 +996,45 @@ class BrowserSignInJsFormTestCase(unittest.TestCase):
                                         r"等待提交（模拟真人输入节奏）.*linux\.sb/login"):
                 daily.browser_sign_in(dict(self.CREDS))
         self.assertTrue(driver.submitted)
+
+
+class BrowserCookieInjectTestCase(unittest.TestCase):
+    """浏览器 Cookie 注入通道测试（2026-08-30 invalid cookie domain 修复的回归）"""
+
+    def test_注入不带domain并跳过IP绑定项(self):
+        """add_cookie 不传 domain（Chrome 151 chromedriver 拒绝显式 domain），cf_clearance 等照旧跳过"""
+        driver = FakeDriver(BROWSER_PAGE_CHECKED,
+                            cookies=[{"name": "bbs_auth", "value": "x"}])
+        cookie = ("bbs_auth=abc; bbs_csrf=csrf1; cf_clearance=old; _ga_x=1; "
+                  "__recent_forums=2")
+        with mock.patch.object(daily, "create_driver", return_value=driver):
+            ok, summary, username = daily.browser_sign_in_with_cookie(cookie)
+        self.assertTrue(ok)
+        # 注入的 cookie 全部不带 domain 键（由 chromedriver 按当前页面落域）
+        for item in driver.added_cookies:
+            self.assertNotIn("domain", item)
+        injected_names = [c["name"] for c in driver.added_cookies]
+        self.assertEqual(injected_names, ["bbs_auth", "bbs_csrf", "__recent_forums"])
+        self.assertIn("今日已签到", summary)
+
+    def test_当前页不在目标域时先回首页再注入(self):
+        """浏览器停在非 linux.sb 页面（如空白页）时，先重新打开首页再注入，避免 cookie 落错域"""
+        driver = FakeDriver(BROWSER_PAGE_CHECKED, landing="about:blank",
+                            cookies=[{"name": "bbs_auth", "value": "x"}])
+        with mock.patch.object(daily, "create_driver", return_value=driver):
+            ok, _, _ = daily.browser_sign_in_with_cookie("bbs_auth=abc")
+        self.assertTrue(ok)
+        # 第一次 get 首页 + 发现不在目标域后重新 get 首页
+        self.assertEqual(driver.get_calls.count(daily.BASE_URL), 2)
+        self.assertTrue(driver.added_cookies)
+
+    def test_无有效cookie可注入时判定失效(self):
+        """cookie 字符串全是跳过项时注入 0 个，抛 CookieExpired 交给上层转账号密码兜底"""
+        driver = FakeDriver(BROWSER_PAGE_CHECKED)
+        with mock.patch.object(daily, "create_driver", return_value=driver):
+            with self.assertRaises(daily.CookieExpired):
+                daily.browser_sign_in_with_cookie("cf_clearance=old; _ga=1")
+        self.assertEqual(driver.added_cookies, [])
 
 
 class RunTestCase(unittest.TestCase):

@@ -293,11 +293,16 @@ def is_cloudflare_challenge(driver):
         return False
 
 
-def wait_for_cloudflare(driver, timeout=60):
+def wait_for_cloudflare(driver, timeout=120):
     """
     等待 Cloudflare 挑战自行通过，返回是否已离开挑战页。
     undetected-chromedriver 通常能自动过盾但需要时间；超时返回 False，
     由调用方决定是就此失败还是继续往下试。
+
+    挑战有「顽固期」（2026-08-30 Actions 实测登录页 60 秒未过、次日同样配置
+    2 秒即过）：默认上限 120 秒，给顽固挑战更多时间；仍不过则由外层
+    _browser_with_retry 拉开间隔重开浏览器再试——间隔够长才可能碰上挑战松开的
+    窗口。
     """
     if not is_cloudflare_challenge(driver):
         return True
@@ -494,6 +499,13 @@ def browser_sign_in_with_cookie(cookie):
             raise RuntimeError("首页未通过 Cloudflare 挑战，无法注入 Cookie")
 
         stage.set("注入 Cookie")
+        # 注入前确认浏览器确实停在 linux.sb 域：add_cookie 不带 domain 时
+        # chromedriver 按当前页面的 host 落 cookie，停在别的页面（如空白页/错误页）
+        # 会把 cookie 落到错误的域上
+        if "linux.sb" not in (driver.current_url or ""):
+            print(f"[linux.sb] 当前页面 {driver.current_url} 不在 linux.sb，重新打开首页")
+            driver.get(BASE_URL)
+            wait_for_cloudflare(driver)
         injected = []
         skipped = []
         cookie_items = parse_cookies(cookie)
@@ -505,9 +517,11 @@ def browser_sign_in_with_cookie(cookie):
                 skipped.append(name)
                 continue
             try:
-                # domain 用带前导点的形式覆盖子域，与 nodeseek 注入策略一致
-                driver.add_cookie({"name": name, "value": value,
-                                   "domain": ".linux.sb", "path": "/"})
+                # 不传 domain：Chrome 151 的 chromedriver 会拒绝显式
+                # domain=".linux.sb"（invalid cookie domain，2026-08-30 Actions
+                # 实测 9 个 cookie 全部注入失败）；省略后由 chromedriver 按
+                # 当前页面 host 自动落域，效果相同且跨版本稳定
+                driver.add_cookie({"name": name, "value": value, "path": "/"})
                 injected.append(name)
             except Exception as exc:
                 print(f"[linux.sb] 注入 cookie {name} 失败：{exc}")
@@ -705,7 +719,10 @@ def _browser_with_retry(action, func, arg, max_attempts=_BROWSER_LOGIN_MAX_ATTEM
             last_error = exc
             print(f"[linux.sb] 浏览器{action}第 {attempt} 次尝试失败：{exc}")
             if attempt < max_attempts:
-                time.sleep(5)  # 重试前短暂停顿，避免紧挨着重启浏览器被风控
+                # 重试前停 30 秒：过盾失败等环境性抽风往往与 Cloudflare 的
+                # 「顽固期」相关，紧挨着重开浏览器大概率撞同一堵墙；拉开
+                # 间隔才可能碰上挑战松开的窗口（挑战是间歇性的）
+                time.sleep(30)
     raise RuntimeError(f"浏览器{action}连续 {max_attempts} 次失败：{last_error}") from last_error
 
 
