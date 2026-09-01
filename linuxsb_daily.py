@@ -1123,10 +1123,12 @@ def run():
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             # 先探测当前账号 cookie 是否有效：有效直接在 requests 通道签到；被
-            # Cloudflare 挑战拦截则转浏览器 Cookie 通道；登录态缺失（302 到
-            # /login）则转账号密码登录。仅 LINUXSB_COOKIE 阳性账号探测。
-            # 探测与 requests 签到放在同一个 try 内：挑战可能在探测通过之后才
-            # 生效（站点中途开盾），两处命中都要走同一条浏览器兜底路径。
+            # Cloudflare 挑战拦截、或 requests 被弹回登录页（可能只是站点按
+            # 客户端环境歧视 requests，见下方 is_login 分支）都转浏览器 Cookie
+            # 通道；浏览器内仍无登录态才转账号密码登录。仅 LINUXSB_COOKIE
+            # 阳性账号探测。探测与 requests 签到放在同一个 try 内：挑战可能
+            # 在探测通过之后才生效（站点中途开盾），两处命中都要走同一条
+            # 浏览器兜底路径。
             result = None  # requests 通道已出结果时为 (成功, 摘要, 用户名)
             # 与 bool(cookie) 相与：无 Cookie 账号本就该直接走账号密码通道，
             # 强制开关不能把 None 送进浏览器 Cookie 通道
@@ -1136,6 +1138,16 @@ def run():
                     csrf, _checked_in, is_login = fetch_checkin_state(cookie)
                     if csrf is not None and not is_login:
                         result = sign_in_account(cookie)
+                    elif is_login:
+                        # requests 被弹回登录页不一定是 Cookie 失效：站点会按
+                        # 客户端环境校验会话（2026-09-01 实测：同一份 Cookie，
+                        # requests 探测 302 到 /login，浏览器注入后登录态有效
+                        # 且签到成功）。先转浏览器 Cookie 通道复核，浏览器内
+                        # 仍未登录才是真失效，才值得动用账号密码登录（登录
+                        # 兜底可能撞上邮箱验证风控，是最后手段）
+                        cf_blocked = True
+                        print("[linux.sb] requests 通道未取得登录态（站点可能按"
+                              "客户端环境校验会话），改用浏览器注入 Cookie 复核")
                 except CloudflareChallenged as challenge:
                     # requests 通道整条不可用（签到 POST 与概览 GET 同样会被拦），
                     # 必须整体改走浏览器，不能只补这一个请求
@@ -1149,7 +1161,8 @@ def run():
                 try:
                     success, summary, username = browser_cookie_sign_in_with_retry(cookie)
                 except CookieExpired as expired:
-                    # 浏览器已过挑战但仍未登录：Cookie 本身失效，转账号密码兜底
+                    # 浏览器环境（过盾后）仍未取得登录态：Cookie 对站点真失效，
+                    # 转账号密码兜底（或无凭据时直接报失效）
                     print(f"[linux.sb] 浏览器内 Cookie 未取得登录态（{expired}）")
                     if creds and not login_used:
                         print("[linux.sb] 改用账号密码浏览器登录并签到")

@@ -703,6 +703,83 @@ class RunCloudflareFallbackTestCase(unittest.TestCase):
         login_mock.assert_called_once()
         self.assertIn("小明", send_mock.call_args.args[1])
 
+
+# requests 探测被弹回登录页时页面特征：fetch_checkin_state 判 is_login=True
+LOGIN_REDIRECT_PAGE = (
+    '<html><body><form><input name="username" type="text">'
+    '<input name="password" type="password"></form></body></html>'
+)
+
+
+class RunRequestsLoginFallbackTestCase(unittest.TestCase):
+    """run() 在 requests 判未登录（302 到登录页）时先浏览器复核 Cookie 的流程测试
+
+    2026-09-01 实测：站点按客户端环境校验会话——同一份 Cookie，requests 探测
+    被 302 到 /login，浏览器注入后登录态有效。requests 判未登录不能直接当
+    Cookie 失效转账号密码登录（登录兜底可能撞邮箱验证风控），必须先复核。
+    """
+
+    def setUp(self):
+        # 屏蔽 run() 签到前的 SITE_GAP 随机延迟
+        mock.patch.object(daily.time, "sleep").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def tearDown(self):
+        for name in ("LINUXSB_COOKIE", "LINUXSB_ACCOUNT", "LINUXSB_FORCE_BROWSER"):
+            os.environ.pop(name, None)
+
+    def test_requests判未登录时先浏览器复核cookie(self):
+        """复核成功（登录态对浏览器环境有效）直接就地签到，不动用账号密码登录"""
+        os.environ["LINUXSB_COOKIE"] = "bbs_auth=abc"
+        os.environ["LINUXSB_ACCOUNT"] = '{"username": "u", "password": "p"}'
+        with fake_get(LOGIN_REDIRECT_PAGE), \
+             mock.patch.object(daily, "browser_cookie_sign_in_with_retry",
+                               return_value=(True, "签到结果: 签到成功（浏览器）",
+                                             "小明")) as cookie_mock, \
+             mock.patch.object(daily, "browser_sign_in_with_retry") as login_mock, \
+             mock.patch.object(daily.notify, "send") as send_mock:
+            code = daily.run()
+
+        self.assertEqual(code, 0)
+        # 复核通道收到原样 cookie
+        cookie_mock.assert_called_once_with("bbs_auth=abc")
+        # 复核已成功就不该再动用账号密码登录
+        login_mock.assert_not_called()
+        self.assertIn("小明", send_mock.call_args.args[1])
+
+    def test_浏览器复核仍失效时回落账号密码登录(self):
+        """浏览器内仍无登录态才是真失效：转账号密码兜底登录"""
+        os.environ["LINUXSB_COOKIE"] = "bbs_auth=expired"
+        os.environ["LINUXSB_ACCOUNT"] = '{"username": "u", "password": "p"}'
+        with fake_get(LOGIN_REDIRECT_PAGE), \
+             mock.patch.object(daily, "browser_cookie_sign_in_with_retry",
+                               side_effect=daily.CookieExpired("登录态未生效")
+                               ) as cookie_mock, \
+             mock.patch.object(daily, "browser_sign_in_with_retry",
+                               return_value=(True, "签到结果: 签到成功", "小明")
+                               ) as login_mock, \
+             mock.patch.object(daily.notify, "send") as send_mock:
+            code = daily.run()
+
+        self.assertEqual(code, 0)
+        cookie_mock.assert_called_once()
+        login_mock.assert_called_once_with({"username": "u", "password": "p"})
+        self.assertIn("签到成功", send_mock.call_args.args[1])
+
+    def test_复核失效且无凭据时报cookie失效(self):
+        """无凭据兜底时如实报失效并指引更新 Cookie"""
+        os.environ["LINUXSB_COOKIE"] = "bbs_auth=expired"
+        with fake_get(LOGIN_REDIRECT_PAGE), \
+             mock.patch.object(daily, "browser_cookie_sign_in_with_retry",
+                               side_effect=daily.CookieExpired("登录态未生效")), \
+             mock.patch.object(daily.notify, "send") as send_mock:
+            code = daily.run()
+
+        self.assertEqual(code, 1)
+        content = send_mock.call_args.args[1]
+        self.assertIn("Cookie 已失效", content)
+        self.assertIn("更新 LINUXSB_COOKIE", content)
+
     def test_未设置强制开关时仍优先requests快通道(self):
         """开关默认关闭：站点未开盾时保持 requests 通道，不无谓启动浏览器"""
         os.environ["LINUXSB_COOKIE"] = "bbs_auth=abc"
