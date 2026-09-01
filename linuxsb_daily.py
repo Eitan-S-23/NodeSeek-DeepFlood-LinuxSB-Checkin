@@ -231,6 +231,15 @@ class CheckinRejected(RuntimeError):
     """服务端明确拒绝签到（ok:0 且非「已签到」类文案），属业务失败而非流程异常。"""
 
 
+class LoginVerificationRequired(RuntimeError):
+    """
+    站点风控要求邮箱二次确认登录（2026-09-01 Actions 实测：密码验证通过后
+    跳到 user_review_login_email 页等待邮箱确认，登录态并未建立）。这不是
+    流程异常也不是环境抽风——重开浏览器重试只会再触发一封确认邮件，必须
+    直接上抛：人工在本地完成邮箱验证登录并更新 Cookie 后方可恢复。
+    """
+
+
 class _Stage:
     """
     记录浏览器流程当前所处阶段，失败时写进异常信息便于定位是哪一步挂的。
@@ -671,6 +680,13 @@ def browser_sign_in(creds):
         # 该站登录表单只在 /login 呈现，登录成功后其他页面不再有密码输入框；
         # 登录失败停留在 /login（表单恒在）会在此超时并明确报错
         wait.until(lambda d: 'name="password"' not in (d.page_source or ""))
+        # 邮箱验证页没有 password 输入框（上面的等待会通过），但不能当成
+        # 登录成功——登录态要等邮箱确认后才建立。见 LoginVerificationRequired
+        if "user_review_login_email" in (driver.current_url or ""):
+            raise LoginVerificationRequired(
+                "站点要求邮箱验证登录（新 IP/设备风控，停在 user_review_login_email"
+                " 页），自动登录无法完成：请在本地浏览器登录 linux.sb 完成邮箱"
+                "验证，再复制 Cookie 更新 LINUXSB_COOKIE")
         print(f"[linux.sb] 账号密码登录成功（URL {driver.current_url}），开始签到")
 
         # 以同一浏览器会话访问签到页并执行签到（与 Cookie 通道共用同一段逻辑）。
@@ -681,6 +697,10 @@ def browser_sign_in(creds):
     except CheckinRejected as exc:
         # 服务端明确拒绝签到属业务结果，按失败上报即可，不必重开浏览器重试
         return False, str(exc), None
+    except LoginVerificationRequired:
+        # 邮箱验证只能人工完成，重开浏览器只会再触发一封确认邮件：直接上抛，
+        # 也不走 _browser_failure 包装（URL 已足够定位，无需再 dump 页面）
+        raise
     except Exception as exc:
         raise _browser_failure(driver, stage, exc, "登录/签到") from exc
     finally:
@@ -705,6 +725,8 @@ def _browser_with_retry(action, func, arg, max_attempts=_BROWSER_LOGIN_MAX_ATTEM
 
     CookieExpired 不重试直接上抛：Cookie 失效重开浏览器也不会变有效，
     由调用方转去账号密码兜底登录才有意义。
+    LoginVerificationRequired 同样直接上抛：邮箱验证只能人工完成，重试只会
+    再触发一封确认邮件，还可能加重风控。
     每次尝试打印动作名与序号，便于从日志分辨是「一次都没成」还是「第 N 次才成」。
     """
     last_error = None
@@ -713,7 +735,7 @@ def _browser_with_retry(action, func, arg, max_attempts=_BROWSER_LOGIN_MAX_ATTEM
             if attempt > 1:
                 print(f"[linux.sb] 浏览器{action}第 {attempt} 次重试（共 {max_attempts} 次）")
             return func(arg)
-        except CookieExpired:
+        except (CookieExpired, LoginVerificationRequired):
             raise
         except Exception as exc:
             last_error = exc

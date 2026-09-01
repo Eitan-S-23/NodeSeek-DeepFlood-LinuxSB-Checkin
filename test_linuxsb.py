@@ -730,7 +730,7 @@ class FakeDriver:
 
     def __init__(self, page, cookies=None, script_result=None, landing=None,
                  title="每日签到 - 烧饼社区", captcha_question=None,
-                 login_csrf=None, after_login_page=None):
+                 login_csrf=None, after_login_page=None, after_login_url=None):
         self.page = page
         self._cookies = cookies or []
         self.script_result = script_result
@@ -744,6 +744,7 @@ class FakeDriver:
         self.captcha_question = captcha_question  # 读题面脚本的返回值
         self.login_csrf = login_csrf              # 填表脚本返回的 _csrf
         self.after_login_page = after_login_page  # 提交后切换到的页面（模拟登录成功）
+        self.after_login_url = after_login_url    # 提交后跳转的 URL（如邮箱验证页）
         self.fill_calls = []                      # (username, password, answer) 记录
         self.submitted = False
         self.added_cookies = []                   # add_cookie 的调用记录
@@ -785,6 +786,8 @@ class FakeDriver:
             self.submitted = True
             if self.after_login_page is not None:
                 self.page = self.after_login_page
+            if self.after_login_url is not None:
+                self.current_url = self.after_login_url
             return True
         selector = args[0] if args else ""
         self.dom_queries.append(selector)
@@ -996,6 +999,37 @@ class BrowserSignInJsFormTestCase(unittest.TestCase):
                                         r"等待提交（模拟真人输入节奏）.*linux\.sb/login"):
                 daily.browser_sign_in(dict(self.CREDS))
         self.assertTrue(driver.submitted)
+
+    def test_提交后落入邮箱验证页时上报需人工介入(self):
+        """站点风控要求邮箱二次确认（user_review_login_email）：抛 LoginVerificationRequired 而非误判登录成功"""
+        # 验证页无 password 框（密码等待会通过），但登录态并未建立
+        review_page = ('<html><head><title>登录确认</title></head><body>'
+                       '<div>已发送验证邮件，请前往邮箱确认</div></body></html>')
+        driver = FakeDriver(LOGIN_PAGE, captcha_question="9 × 7 = ?",
+                            login_csrf="logincsrf", after_login_page=review_page,
+                            after_login_url="https://linux.sb/user_review_login_email")
+        with mock.patch.object(daily, "create_driver", return_value=driver), \
+             mock.patch.object(daily.time, "sleep"):
+            with self.assertRaisesRegex(daily.LoginVerificationRequired,
+                                        "user_review_login_email.*LINUXSB_COOKIE"):
+                daily.browser_sign_in(dict(self.CREDS))
+        self.assertTrue(driver.submitted)
+
+    def test_邮箱验证要求不触发浏览器重试(self):
+        """LoginVerificationRequired 属人工介入事项：_browser_with_retry 不重开浏览器直接上抛"""
+        calls = []
+
+        def always_rejected(_):
+            calls.append(1)
+            raise daily.LoginVerificationRequired("需邮箱验证")
+
+        with mock.patch.object(daily.time, "sleep") as sleep_mock:
+            with self.assertRaises(daily.LoginVerificationRequired):
+                daily._browser_with_retry("登录", always_rejected, None,
+                                          max_attempts=3)
+        # 只执行一次（CookieExpired 同款处理），既不重试也不做重试间隔等待
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
 
 
 class BrowserCookieInjectTestCase(unittest.TestCase):
