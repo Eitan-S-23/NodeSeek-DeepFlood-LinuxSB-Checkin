@@ -26,6 +26,12 @@ PAGE_CHECKED = (
     '<span>今日已签到</span>'
     '</body></html>'
 )
+# 真实已签到页面不再渲染 _csrf（2026-09-01 Actions 实测）：csrf=None 时
+# 旧逻辑把它当 Cookie 失效掉进登录兜底，误触邮箱验证风控
+PAGE_CHECKED_NO_CSRF = (
+    '<html><body><span>今日已签到</span>'
+    '<a class="user-name" href="/user/42">烧饼爱好者</a></body></html>'
+)
 # 模拟 Cloudflare 托管挑战页（站点 2026-08 起对非浏览器客户端全站返回此页）
 CF_CHALLENGE_PAGE = (
     '<!DOCTYPE html><html><head><title>Just a moment...</title>'
@@ -779,6 +785,26 @@ class RunRequestsLoginFallbackTestCase(unittest.TestCase):
         content = send_mock.call_args.args[1]
         self.assertIn("Cookie 已失效", content)
         self.assertIn("更新 LINUXSB_COOKIE", content)
+
+    def test_探测到已签到时直接成功不碰浏览器(self):
+        """已签到页不渲染 _csrf（csrf=None）：按成功收尾，不能误判失效触发登录兜底"""
+        os.environ["LINUXSB_COOKIE"] = "bbs_auth=abc"
+        os.environ["LINUXSB_ACCOUNT"] = '{"username": "u", "password": "p"}'
+        with fake_get(PAGE_CHECKED_NO_CSRF), \
+             mock.patch.object(daily.requests, "post") as post_mock, \
+             mock.patch.object(daily, "browser_cookie_sign_in_with_retry"
+                               ) as cookie_mock, \
+             mock.patch.object(daily, "browser_sign_in_with_retry") as login_mock, \
+             mock.patch.object(daily.notify, "send") as send_mock:
+            code = daily.run()
+
+        self.assertEqual(code, 0)
+        # 已签到既不发签到 POST，也不开任何浏览器
+        post_mock.assert_not_called()
+        cookie_mock.assert_not_called()
+        login_mock.assert_not_called()
+        content = send_mock.call_args.args[1]
+        self.assertIn("今日已签到", content)
 
     def test_未设置强制开关时仍优先requests快通道(self):
         """开关默认关闭：站点未开盾时保持 requests 通道，不无谓启动浏览器"""

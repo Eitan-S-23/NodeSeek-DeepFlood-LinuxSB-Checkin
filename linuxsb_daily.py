@@ -1135,7 +1135,7 @@ def run():
             cf_blocked = force_browser and bool(cookie)
             if cookie and not force_browser:
                 try:
-                    csrf, _checked_in, is_login = fetch_checkin_state(cookie)
+                    csrf, checked_in, is_login = fetch_checkin_state(cookie)
                     if csrf is not None and not is_login:
                         result = sign_in_account(cookie)
                     elif is_login:
@@ -1148,6 +1148,13 @@ def run():
                         cf_blocked = True
                         print("[linux.sb] requests 通道未取得登录态（站点可能按"
                               "客户端环境校验会话），改用浏览器注入 Cookie 复核")
+                    elif checked_in:
+                        # 已签到页不渲染 _csrf（csrf=None）：当天早些时候已签过
+                        # （如浏览器通道签过、或当天重复执行），直接按成功收尾，
+                        # 绝不能掉进「Cookie 失效」分支再触发登录兜底
+                        summary, username = _build_summary(
+                            ["签到结果: 今日已签到，无需重复签到"], cookie)
+                        result = (True, summary, username)
                 except CloudflareChallenged as challenge:
                     # requests 通道整条不可用（签到 POST 与概览 GET 同样会被拦），
                     # 必须整体改走浏览器，不能只补这一个请求
