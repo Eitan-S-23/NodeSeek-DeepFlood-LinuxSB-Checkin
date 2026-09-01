@@ -846,6 +846,14 @@ def fetch_checkin_state(cookie):
     match = CSRF_RE.search(html)
     csrf = match.group(1) if match else None
     checked_in = CHECKED_IN_TEXT in html
+    if csrf is None and not checked_in:
+        # 已登录的签到页必渲染 csrf（签到表单）或「已签到」文案，两者皆无
+        # 说明站点把本请求当作未登录访客渲染了未登录版页面（HTTP 200、URL
+        # 不变——2026-09-01 取证日志实测，站点按客户端环境歧视 requests：
+        # 同一份 Cookie，requests 拿到无 csrf 的未登录版页面，浏览器注入后
+        # 登录态有效签到成功）。按未登录处理转浏览器复核，绝不能误判
+        # Cookie 失效直闯账号密码登录兜底（登录会撞邮箱验证风控）
+        return None, False, True
     return csrf, checked_in, False
 
 
