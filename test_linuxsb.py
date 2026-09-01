@@ -138,6 +138,21 @@ class FetchCheckinStateTestCase(unittest.TestCase):
         self.assertIsNone(csrf)
         self.assertTrue(is_login)
 
+    def test_重定向到登录邮箱确认页时判定未登录(self):
+        """站点按客户端环境把 requests 弹到 user_review_login_email（2026-09-01 实测）：
+        该页无 password 框、URL 不含 /login，识别不出就会误判 Cookie 失效触发登录兜底"""
+        with mock.patch.object(
+            daily.requests, "get",
+            side_effect=lambda *a, **k: FakeResponse(
+                status_code=200, text="<html>已发送验证邮件，请前往邮箱确认</html>",
+                url="https://linux.sb/user_review_login_email",
+            ),
+        ):
+            csrf, checked_in, is_login = daily.fetch_checkin_state("a=1")
+        self.assertIsNone(csrf)
+        self.assertFalse(checked_in)
+        self.assertTrue(is_login)
+
 
 class SignInAccountTestCase(unittest.TestCase):
     """单账号签到流程测试"""
@@ -805,6 +820,29 @@ class RunRequestsLoginFallbackTestCase(unittest.TestCase):
         login_mock.assert_not_called()
         content = send_mock.call_args.args[1]
         self.assertIn("今日已签到", content)
+
+    def test_被弹到邮箱验证页时浏览器复核(self):
+        """2026-09-01 Actions 真实路径：requests 探测 302 到 user_review_login_email，
+        验证页无 password 框与 csrf——必须识别为未登录走浏览器复核，而非登录兜底"""
+        def get_handler(url, headers=None, cookies=None, timeout=None):
+            return FakeResponse(text="<html>已发送验证邮件，请前往邮箱确认</html>",
+                                url="https://linux.sb/user_review_login_email")
+
+        os.environ["LINUXSB_COOKIE"] = "bbs_auth=abc"
+        os.environ["LINUXSB_ACCOUNT"] = '{"username": "u", "password": "p"}'
+        with mock.patch.object(daily.requests, "get", side_effect=get_handler), \
+             mock.patch.object(daily, "browser_cookie_sign_in_with_retry",
+                               return_value=(True, "签到结果: 签到成功（浏览器）",
+                                             "小明")) as cookie_mock, \
+             mock.patch.object(daily, "browser_sign_in_with_retry") as login_mock, \
+             mock.patch.object(daily.notify, "send") as send_mock:
+            code = daily.run()
+
+        self.assertEqual(code, 0)
+        # 浏览器复核成功后不碰账号密码登录（会撞邮箱验证风控）
+        cookie_mock.assert_called_once_with("bbs_auth=abc")
+        login_mock.assert_not_called()
+        self.assertIn("小明", send_mock.call_args.args[1])
 
     def test_未设置强制开关时仍优先requests快通道(self):
         """开关默认关闭：站点未开盾时保持 requests 通道，不无谓启动浏览器"""

@@ -797,12 +797,15 @@ def parse_cookies(raw_cookie):
 
 def fetch_checkin_state(cookie):
     """
-    访问签到页，返回 (csrf_token, 是否已签到, 是否为登录页)。
+    访问签到页，返回 (csrf_token, 是否已签到, 是否未取得登录态)。
 
-    注意区分「签到页」与「登录页」：未登录访问 /daily_checkin 会被 302 到
-    /login，而登录页的登录表单同样带 name="_csrf" 隐藏字段——若把登录页的
-    CSRF 当作有效凭据，会在未登录状态下提交出「假签到成功」。因此 URL 落在
-    /login 或页面含密码输入框时视为 cookie 失效，csrf 返回 None。
+    注意区分「签到页」与「未登录」：未登录访问 /daily_checkin 会被 302 到
+    /login；站点还会按客户端环境把 requests 弹到登录邮箱二次确认页
+    user_review_login_email（2026-09-01 实测：同一份 Cookie，requests 探测
+    落在验证页，浏览器注入后登录态有效）。这两种「未取得登录态」的页面
+    都返回 is_login=True，由调用方转浏览器 Cookie 通道复核——登录页的
+    登录表单同样带 name="_csrf" 隐藏字段，若把它当有效凭据，会在未登录
+    状态下提交出「假签到成功」，故此时 csrf 返回 None。
 
     站点开启 Cloudflare 托管挑战时抛 CloudflareChallenged（而非通用异常），
     由调用方切换到浏览器通道；其余非 200 才是真正的请求失败。
@@ -824,8 +827,11 @@ def fetch_checkin_state(cookie):
 
     html = response.text
     final_url = getattr(response, "url", None) or CHECKIN_URL
-    # 登录页特征：最终 URL 是 /login，或 HTML 含登录表单的密码输入框
-    if "/login" in final_url or 'name="password"' in html:
+    # 未取得登录态的三种特征：最终 URL 是 /login 或登录邮箱确认页，
+    # 或 HTML 含登录表单的密码输入框
+    if ("/login" in final_url
+            or "user_review_login_email" in final_url
+            or 'name="password"' in html):
         return None, CHECKED_IN_TEXT in html, True
 
     match = CSRF_RE.search(html)
@@ -994,7 +1000,8 @@ def sign_in_account(cookie):
 
     if csrf is None:
         # 仅当页面是真正的签到页（模板不再渲染 _csrf 字段）时才回退到
-        # cookie 中的 bbs_csrf；登录页说明 cookie 已失效，绝不兜底（否则假签到）
+        # cookie 中的 bbs_csrf；登录/邮箱验证页说明 requests 环境未取得
+        # 登录态，绝不兜底（否则假签到）
         if not is_login_page:
             page_csrf = (parse_cookies(cookie) or {}).get("bbs_csrf")
             if page_csrf:
