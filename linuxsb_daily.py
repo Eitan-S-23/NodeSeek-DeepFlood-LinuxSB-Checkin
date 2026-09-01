@@ -827,6 +827,12 @@ def fetch_checkin_state(cookie):
 
     html = response.text
     final_url = getattr(response, "url", None) or CHECKIN_URL
+    # 探测结果的一行取证日志：排查「探测返回什么导致走了某分支」全靠它
+    # （不打印 cookie 与页面正文，只打特征与长度，无凭据泄漏）
+    print(f"[linux.sb] 探测签到页：HTTP {response.status_code}，URL {final_url}，"
+          f"长度 {len(html)}，csrf={'有' if CSRF_RE.search(html) else '无'}，"
+          f"password框={'name=\"password\"' in html}，"
+          f"已签到={CHECKED_IN_TEXT in html}", flush=True)
     # 未取得登录态的三种特征：最终 URL 是 /login 或登录邮箱确认页，
     # 或 HTML 含登录表单的密码输入框
     if ("/login" in final_url
