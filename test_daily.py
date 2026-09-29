@@ -5,6 +5,8 @@ nodeseek_daily 依赖 selenium / undetected_chromedriver 等浏览器库，
 本地与 CI 的单测环境不一定安装，这里用桩模块替换后再导入，
 使开关逻辑与正文拼装可以脱离浏览器独立验证。
 """
+import contextlib
+import io
 import sys
 import types
 import unittest
@@ -249,6 +251,38 @@ class RunTestCase(unittest.TestCase):
         # 签到判定由 click_sign_icon 内部把关，这里被 mock 成成功，仅验证登录态传递
         self.assertEqual(code, 0)
 
+    def test_截断粘贴经试注入确认登录后日志点明无需重贴(self):
+        # 无名片段试注入 + 账号概览抓到 = 片段就是被截掉名字的 session
+        site = daily.Site("NodeSeek", "nodeseek.com", "0123456789abcdef0123456789abcdef; pjwt=y")
+        m = self._patch_run_env(
+            load_sites=mock.patch.object(daily, "load_sites", return_value=[site]),
+            fetch_account_summary=mock.patch.object(
+                daily, "fetch_account_summary", return_value={"level": "1"}),
+        )
+        log = io.StringIO()
+        with mock.patch.object(daily, "extra_tasks_enabled", False), \
+                m["load_sites"], m["create_driver"], m["inject_site_cookies"], \
+                m["nodeseek_comment"], m["click_sign_icon"], m["fetch_account_summary"], \
+                m["send"], contextlib.redirect_stdout(log):
+            code = daily.run()
+
+        self.assertEqual(code, 0)
+        self.assertIn("登录态已确认：开头的无名片段就是被截掉名字的登录凭据", log.getvalue())
+
+    def test_截断粘贴试注入无效时给出重贴线索(self):
+        site = daily.Site("NodeSeek", "nodeseek.com", "0123456789abcdef0123456789abcdef; pjwt=y")
+        m = self._patch_run_env(
+            load_sites=mock.patch.object(daily, "load_sites", return_value=[site]),
+        )
+        log = io.StringIO()
+        with mock.patch.object(daily, "extra_tasks_enabled", False), \
+                m["load_sites"], m["create_driver"], m["inject_site_cookies"], \
+                m["nodeseek_comment"], m["click_sign_icon"], m["fetch_account_summary"], \
+                m["send"], contextlib.redirect_stdout(log):
+            code = daily.run()
+
+        self.assertIn("试注入仍无效", log.getvalue())
+
 
 class ShouldSkipCookieTestCase(unittest.TestCase):
     """校验 cookie 过滤：环境绑定与统计类 cookie 必须跳过，登录态必须保留。"""
@@ -379,6 +413,38 @@ class CookieLoginFieldTestCase(unittest.TestCase):
         self.assertFalse(daily.cookie_has_login(self._site(raw)))
 
 
+class OrphanLoginCandidateTestCase(unittest.TestCase):
+    """校验"被截掉名字的登录凭据"候选识别。
+
+    2026-09-30 的运行日志显示开头片段"长度 32，不含等号"，排除了引号/BOM 包裹，
+    指向粘贴被从头截断；此时片段很可能就是丢了名字的 session 值，必须作为候选试注入。
+    """
+
+    def _site(self, raw):
+        return daily.Site("NodeSeek", "nodeseek.com", raw)
+
+    def test_无名片段作为候选返回(self):
+        fragment = "0123456789abcdef0123456789abcdef"
+        self.assertEqual(daily.orphan_login_candidate(self._site(f"{fragment}; pjwt=y")), fragment)
+
+    def test_正常cookie串没有候选(self):
+        self.assertIsNone(daily.orphan_login_candidate(self._site("session=abc; pjwt=y")))
+        self.assertIsNone(daily.orphan_login_candidate(self._site("pjwt=xyz; smac=1")))
+
+    def test_包裹剥离后是正常cookie则无候选(self):
+        self.assertIsNone(daily.orphan_login_candidate(self._site('"session=abc; pjwt=y"')))
+
+    def test_含空白的片段不算候选(self):
+        # cookie 值里不会有空白，出现空白说明片段是说明文字之类的垃圾
+        self.assertIsNone(daily.orphan_login_candidate(self._site("某站点说明 abc; pjwt=y")))
+
+    def test_过短片段不算候选(self):
+        self.assertIsNone(daily.orphan_login_candidate(self._site("abc; pjwt=y")))
+
+    def test_空cookie没有候选(self):
+        self.assertIsNone(daily.orphan_login_candidate(self._site("")))
+
+
 class _FakeDriver:
     """只提供判定所需属性的最小 driver 桩。"""
 
@@ -387,9 +453,16 @@ class _FakeDriver:
         self.title = "NodeSeek"
         self.current_url = "https://www.nodeseek.com/board"
         self.page_source = "<html></html>"
+        self.cookies = []
 
     def get(self, url):
         self.current_url = url
+
+    def add_cookie(self, cookie):
+        self.cookies.append((cookie["name"], cookie["value"]))
+
+    def refresh(self):
+        pass
 
 
 class _TextSoup:
@@ -474,6 +547,46 @@ class ClickSignIconTestCase(unittest.TestCase):
         result = self._click("今日签到", logged_in=False, site=site)
         self.assertFalse(result["success"])
         self.assertIn("cookie 可能不完整或已失效", result["detail"])
+
+    def test_截断粘贴试注入无效时日志点明粘贴被截断(self):
+        # 有可试注入的无名片段却没签到成功，说明片段不是凭据，日志要指明这一点
+        site = daily.Site("NodeSeek", "nodeseek.com",
+                          "0123456789abcdef0123456789abcdef; pjwt=y")
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            result = self._click("今日签到", logged_in=False, site=site)
+
+        self.assertFalse(result["success"])
+        self.assertIn("试注入仍无效，粘贴确实被截断", log.getvalue())
+
+
+class InjectSiteCookiesTestCase(unittest.TestCase):
+    """校验注入阶段：粘贴被从头截断时，要用开头的无名片段补一次登录凭据试注入。"""
+
+    FRAGMENT = "0123456789abcdef0123456789abcdef"
+
+    def _inject(self, raw):
+        site = daily.Site("NodeSeek", "nodeseek.com", raw)
+        driver = _FakeDriver("")
+        log = io.StringIO()
+        with mock.patch.object(daily, "wait_for_cloudflare", lambda *a, **k: True), \
+                mock.patch.object(daily.time, "sleep", lambda *_: None), \
+                contextlib.redirect_stdout(log):
+            ok = daily.inject_site_cookies(driver, site)
+        return ok, driver, log.getvalue()
+
+    def test_被截断时用无名片段补session(self):
+        ok, driver, output = self._inject(f"{self.FRAGMENT}; cf_clearance=x; pjwt=y; smac=z")
+        self.assertTrue(ok)
+        self.assertEqual(dict(driver.cookies)["session"], self.FRAGMENT)
+        self.assertIn("试注入", output)
+        # 片段内容属凭据，只允许形状描述进日志
+        self.assertNotIn(self.FRAGMENT, output)
+
+    def test_正常cookie串不额外补session(self):
+        ok, _, output = self._inject("session=abc; pjwt=y")
+        self.assertTrue(ok)
+        self.assertNotIn("试注入", output)
 
 
 if __name__ == "__main__":

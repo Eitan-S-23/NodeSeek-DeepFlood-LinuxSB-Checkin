@@ -189,6 +189,39 @@ def cookie_has_login(site):
     return any(name.strip().lower() == "session" for name, _ in pairs)
 
 
+# 被截断的粘贴里，无名片段的长度下限。过短的片段不像凭据值，避免把垃圾注入成 session。
+MIN_ORPHAN_TOKEN_LENGTH = 8
+
+
+def orphan_login_candidate(site):
+    """
+    取 cookie 串开头的无名片段，作为"被截掉名字的登录凭据"候选；无此形态时返回 None。
+
+    粘贴被从头截断时（2026-09-30 事故的真实形态：开头 32 字符没有 cookie 名，
+    colorscheme/hmti_/session 三条整体丢失），残留片段往往正是被截掉名字的 session 值。
+    直接丢弃会让浏览器停在未登录状态，所以这里把它交给调用方试注入。
+
+    只做候选不直接采信：注入后由页面的账号概览验真伪，验不过仍按失败处理。
+    返回值含凭据内容，调用方不得写进日志（日志只能用 describe_fragment 描述形状）。
+    """
+    raw = strip_cookie_wrappers(site.cookie)
+    if not raw:
+        return None
+
+    first = re.split(r'[;\r\n]+', raw, maxsplit=1)[0].strip()
+    if not first or len(first) < MIN_ORPHAN_TOKEN_LENGTH:
+        return None
+    # cookie 值里不会有空白，出现空白说明片段是说明文字之类的垃圾
+    if any(char.isspace() for char in first):
+        return None
+
+    name, sep, _ = first.partition('=')
+    if sep and COOKIE_NAME_PATTERN.match(name.strip()):
+        # 开头就是合法 cookie，说明粘贴没被从头截断
+        return None
+    return first
+
+
 def parse_chrome_major_version(version_output):
     """
     从 `chrome --version` 的输出中解析大版本号。
@@ -534,7 +567,10 @@ def click_sign_icon(driver, site, logged_in=True):
                 # 只有确实登录并抓到账号信息才允许按"已签到"收尾。
                 # 通知里只给中性结论，具体线索（如缺 session）打在日志中
                 if not cookie_has_login(site):
-                    print("未确认登录态：cookie 串里没有 session 字段，粘贴大概率不完整", flush=True)
+                    if orphan_login_candidate(site):
+                        print("未确认登录态：开头的无名片段已按登录凭据试注入仍无效，粘贴确实被截断", flush=True)
+                    else:
+                        print("未确认登录态：cookie 串里没有 session 字段，粘贴大概率不完整", flush=True)
                 else:
                     print("未确认登录态：cookie 可能已失效", flush=True)
                 return {"success": False,
@@ -660,6 +696,18 @@ def inject_site_cookies(driver, site):
         for reason in skipped:
             print(f"[{site.name}] 跳过 cookie: {reason}", flush=True)
 
+        # 粘贴被从头截断时，开头的无名片段很可能就是被截掉名字的 session 值
+        # （2026-09-30 事故的真实形态）。丢弃它会让浏览器停在未登录状态，
+        # 这里补进注入列表试一次：随后的账号概览能验证真伪，验不过仍按失败处理。
+        recovered_login = False
+        if not cookie_has_login(site):
+            orphan = orphan_login_candidate(site)
+            if orphan:
+                pairs.append(("session", orphan))
+                recovered_login = True
+                print(f"[{site.name}] 开头的无名片段（{describe_fragment(orphan)}）"
+                      f"按「被截掉名字的登录凭据」试注入，以账号概览确认是否生效", flush=True)
+
         injected = 0
         for name, value in pairs:
             try:
@@ -683,7 +731,7 @@ def inject_site_cookies(driver, site):
             print(f"[{site.name}] 没有任何有效 cookie 被注入，请检查 cookie 格式（应形如 session=xxx）")
             return False
 
-        if not cookie_has_login(site):
+        if not cookie_has_login(site) and not recovered_login:
             # 只作提示不参与判定：session 是 HttpOnly cookie，用 document.cookie
             # 之类的方式复制必然漏掉它，是粘贴不完整最常见的形态
             print(f"[{site.name}] 提示: cookie 串里没有 session 字段，登录态可能不完整；"
@@ -951,12 +999,22 @@ def run():
         # 先抓账号概览：它同时是"已登录"的证据，也是通知里的账号状态来源。
         # 必须早于签到，因为未登录页面上同样会出现"今日签到"这类入口文案，
         # 没有登录态就无法把"页面显示已签到"当成成功依据。
+        # 本站在注入阶段是否做过「无名片段当登录凭据」的试注入。
+        # 与 inject_site_cookies 用同一条件重算（纯函数），避免为传一个标记改动其返回值契约。
+        recovered_login = not cookie_has_login(site) and bool(orphan_login_candidate(site))
+
         print(f"[{site.name}] 抓取账号概览并确认登录态...")
         account_summary = fetch_account_summary(driver, site)
         logged_in = bool(account_summary)
+        if logged_in and recovered_login:
+            print(f"[{site.name}] 登录态已确认：开头的无名片段就是被截掉名字的登录凭据，"
+                  f"本次无需重新粘贴 cookie", flush=True)
         if not logged_in:
             print(f"[{site.name}] 未抓到任何账号概览字段，登录态未确认", flush=True)
-            if not cookie_has_login(site):
+            if recovered_login:
+                print(f"[{site.name}] 线索: 已把开头的无名片段按登录凭据试注入仍无效，"
+                      f"说明粘贴确实被截断或 cookie 已失效，需重新登录后整段复制", flush=True)
+            elif not cookie_has_login(site):
                 print(f"[{site.name}] 线索: cookie 串里没有 session 字段（HttpOnly 项），"
                       f"粘贴可能不完整；若确认已整段复制，则是 cookie 已失效需重新登录", flush=True)
 
