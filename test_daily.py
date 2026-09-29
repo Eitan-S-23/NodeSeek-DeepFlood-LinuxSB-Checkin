@@ -223,6 +223,32 @@ class RunTestCase(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("签到异常", send.call_args.args[0])
 
+    def test_抓到账号概览时先确认登录态再签到(self):
+        m = self._patch_run_env(fetch_account_summary=mock.patch.object(
+            daily, "fetch_account_summary", return_value={"level": "1", "chicken_leg": "118"}))
+        with mock.patch.object(daily, "extra_tasks_enabled", False), \
+                m["load_sites"], m["create_driver"], m["inject_site_cookies"], \
+                m["nodeseek_comment"], m["click_sign_icon"] as sign, \
+                m["fetch_account_summary"], m["send"] as send:
+            code = daily.run()
+
+        self.assertTrue(sign.call_args.kwargs["logged_in"])
+        self.assertEqual(code, 0)
+        self.assertIn("总鸡腿数: 118", send.call_args.args[1])
+
+    def test_账号概览为空时登录态未确认且通知里显形(self):
+        m = self._patch_run_env()
+        with mock.patch.object(daily, "extra_tasks_enabled", False), \
+                m["load_sites"], m["create_driver"], m["inject_site_cookies"], \
+                m["nodeseek_comment"], m["click_sign_icon"] as sign, \
+                m["fetch_account_summary"], m["send"] as send:
+            code = daily.run()
+
+        self.assertFalse(sign.call_args.kwargs["logged_in"])
+        self.assertIn("账号概览: 未抓到", send.call_args.args[1])
+        # 签到判定由 click_sign_icon 内部把关，这里被 mock 成成功，仅验证登录态传递
+        self.assertEqual(code, 0)
+
 
 class ShouldSkipCookieTestCase(unittest.TestCase):
     """校验 cookie 过滤：环境绑定与统计类 cookie 必须跳过，登录态必须保留。"""
@@ -273,6 +299,181 @@ class ParseCookieStringTestCase(unittest.TestCase):
         pairs, skipped = daily.parse_cookie_string("")
         self.assertEqual(pairs, [])
         self.assertEqual(skipped, [])
+
+    def test_开头异常片段提示重新复制(self):
+        # 开头 32 字符没有合法 cookie 名，说明粘贴被截断，必须给出可操作的提示
+        _, skipped = daily.parse_cookie_string("0123456789abcdef0123456789abcdef; session=x")
+        self.assertTrue(any("重新复制" in reason for reason in skipped), skipped)
+
+    def test_异常片段提示包含形状但不含内容(self):
+        # 形状（长度/是否含等号/非法字符类别）用于定位问题来源，内容不得进日志
+        _, skipped = daily.parse_cookie_string("abc0123456789abcdef01234567; session=x")
+        joined = " ".join(skipped)
+        self.assertIn("长度 27", joined)
+        self.assertIn("不含等号", joined)
+
+    def test_去掉开头的BOM(self):
+        # 记事本保存的 UTF-8 文本带 BOM，粘贴进 Secret 后首个 cookie 名会被污染
+        pairs, skipped = daily.parse_cookie_string("﻿session=abc; smac=1")
+        self.assertEqual(self._names(pairs), ["session", "smac"])
+        self.assertEqual(skipped, [])
+
+
+class StripCookieWrappersTestCase(unittest.TestCase):
+    """校验复制包裹剥离。
+
+    包裹物会让首个 cookie 名非法而被整条丢弃：若丢的是登录字段，
+    浏览器就停在未登录状态，页面上的"今日签到"入口文案会被误读成已签到。
+    """
+
+    def _names(self, raw):
+        pairs, _ = daily.parse_cookie_string(raw)
+        return [name for name, _ in pairs]
+
+    def test_成对引号被剥离(self):
+        for raw in ("\"session=abc; pjwt=y\"", "'session=abc; pjwt=y'"):
+            self.assertEqual(self._names(raw), ["session", "pjwt"], raw)
+
+    def test_请求头前缀被剥离(self):
+        for raw in ("Cookie: session=abc; pjwt=y", "Set-Cookie: session=abc; pjwt=y"):
+            self.assertEqual(self._names(raw), ["session", "pjwt"], raw)
+
+    def test_curl参数名被剥离(self):
+        for raw in ("-H 'Cookie: session=abc; pjwt=y'", "--cookie \"session=abc; pjwt=y\"",
+                    "-b session=abc; pjwt=y"):
+            self.assertEqual(self._names(raw), ["session", "pjwt"], raw)
+
+    def test_BOM与引号叠加仍可解析(self):
+        self.assertEqual(self._names("﻿\"session=abc; pjwt=y\""), ["session", "pjwt"])
+
+    def test_不可见字符被清理(self):
+        # 零宽空格等不可见字符同样只可能来自复制，夹在 cookie 名里会让整条被丢弃
+        for invisible in ("\ufeff", "\u200b", "\u200c", "\u200d"):
+            raw = f"{invisible}session=abc; pjwt=y"
+            self.assertEqual(self._names(raw), ["session", "pjwt"], repr(raw))
+
+    def test_剥离后cookie值保持不变(self):
+        # 剥离只动外层包装，值里的分号要继续按既有规则拼回
+        pairs, _ = daily.parse_cookie_string('"session=a;b;c; smac=1"')
+        self.assertEqual(dict(pairs)["session"], "a;b;c")
+
+    def test_正常cookie串不受影响(self):
+        self.assertEqual(self._names("session=abc; pjwt=y"), ["session", "pjwt"])
+
+
+class CookieLoginFieldTestCase(unittest.TestCase):
+    """校验登录态字段识别：缺 session 的 cookie 串必须能被识别出来。"""
+
+    def _site(self, raw):
+        return daily.Site("NodeSeek", "nodeseek.com", raw)
+
+    def test_含_session_视为登录态完整(self):
+        self.assertTrue(daily.cookie_has_login(self._site("colorscheme=dark; session=abc; pjwt=xyz")))
+
+    def test_缺_session_视为登录态不完整(self):
+        self.assertFalse(daily.cookie_has_login(self._site("pjwt=xyz; smac=1")))
+
+    def test_前缀异常片段不影响鉴权字段识别(self):
+        # 2026-09-30 实际形态：粘贴被截断，开头 32 字符没有 cookie 名，session 整条丢失
+        raw = "0123456789abcdef0123456789abcdef; cf_clearance=x; pjwt=y; smac=z"
+        self.assertFalse(daily.cookie_has_login(self._site(raw)))
+
+
+class _FakeDriver:
+    """只提供判定所需属性的最小 driver 桩。"""
+
+    def __init__(self, page_text):
+        self._text = page_text
+        self.title = "NodeSeek"
+        self.current_url = "https://www.nodeseek.com/board"
+        self.page_source = "<html></html>"
+
+    def get(self, url):
+        self.current_url = url
+
+
+class _TextSoup:
+    """把页面源码固定映射为给定文本的 BeautifulSoup 替身。"""
+
+    def __init__(self, text):
+        self._text = text
+
+    def get_text(self, *args, **kwargs):
+        return self._text
+
+
+class _AlwaysTimeoutWait:
+    """模拟 WebDriverWait 等不到元素时抛异常。"""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def until(self, *args, **kwargs):
+        raise TimeoutError("元素未出现")
+
+
+class DetectAlreadySignedTestCase(unittest.TestCase):
+    """校验已签到判定口径：泛化的签到入口文案不能被当成已签到。"""
+
+    def _detect(self, text):
+        driver = _FakeDriver(text)
+        with mock.patch.object(daily, "BeautifulSoup", lambda *a, **k: _TextSoup(text)):
+            return daily.detect_already_signed(driver)
+
+    def test_只有入口文案时不算已签到(self):
+        # 未签到、甚至未登录的页面都会渲染这些词，命中即误报漏签
+        for text in ("今日签到", "已签到", "已经签到", "欢迎回来，今日签到", "今日已签到"):
+            self.assertFalse(self._detect(text), f"{text!r} 不应判为已签到")
+
+    def test_显示签到收益时判为已签到(self):
+        self.assertTrue(self._detect("今日签到获得鸡腿3个"))
+        self.assertTrue(self._detect("签到成功，获得 5 个鸡腿"))
+
+    def test_出现收尾文案时判为已签到(self):
+        self.assertTrue(self._detect("今日奖励已领取，请明天再来"))
+
+    def test_未签到的推广文案不算已签到(self):
+        # "可获得/可领取"是未然措辞，未签到页面上的推广文案不能当成已签到
+        for text in ("每日签到可获得 5 个鸡腿", "签到即可领取鸡腿5个"):
+            self.assertFalse(self._detect(text), f"{text!r} 不应判为已签到")
+
+
+class ClickSignIconTestCase(unittest.TestCase):
+    """校验未确认登录态时绝不按"已签到"收尾（2026-09-30 漏签事故回归用例）。"""
+
+    SITE = daily.Site("NodeSeek", "nodeseek.com", "pjwt=xyz; smac=1")
+
+    def _click(self, text, logged_in, site=None):
+        driver = _FakeDriver(text)
+        with mock.patch.object(daily, "BeautifulSoup", lambda *a, **k: _TextSoup(text)), \
+                mock.patch.object(daily, "WebDriverWait", _AlwaysTimeoutWait), \
+                mock.patch.object(daily.time, "sleep", lambda *_: None):
+            return daily.click_sign_icon(driver, site or self.SITE, logged_in=logged_in)
+
+    def test_未登录时页面签到文案不算已签到(self):
+        # 那天的真实形态：cookie 缺 session → 未登录 → 无按钮 + 页面有"今日签到"入口文案
+        result = self._click("今日签到", logged_in=False)
+        self.assertFalse(result["success"])
+        self.assertIn("未确认登录态", result["detail"])
+        # 通知只给中性结论：判定不依赖 cookie 名，具体线索打在日志里
+        self.assertIn("cookie 可能不完整或已失效", result["detail"])
+
+    def test_已登录且显示收益时仍判已签到(self):
+        result = self._click("今日签到获得鸡腿3个", logged_in=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["detail"], "今日已签到")
+
+    def test_已登录但页面无任何签到标志时报失败(self):
+        result = self._click("欢迎回来", logged_in=True)
+        self.assertFalse(result["success"])
+        self.assertIn("未找到领取按钮", result["detail"])
+
+    def test_cookie_完整但未确认登录态时提示失效(self):
+        # 判定与 cookie 名无关：即便带了 session，抓不到账号概览也不按已签到收尾
+        site = daily.Site("NodeSeek", "nodeseek.com", "session=abc; smac=1")
+        result = self._click("今日签到", logged_in=False, site=site)
+        self.assertFalse(result["success"])
+        self.assertIn("cookie 可能不完整或已失效", result["detail"])
 
 
 if __name__ == "__main__":

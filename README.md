@@ -20,11 +20,11 @@
 
 ### 基础配置
 
-- `NS_COOKIE`: NodeSeek 的 Cookie（必需）
+- `NS_COOKIE`: NodeSeek 的 Cookie（必需）。建议**整段复制**（含 HttpOnly 的 `session`）：`session` 只在浏览器发出的请求头里可见，用控制台 `document.cookie` 之类的方式复制会漏掉它，浏览器就会一直停在未登录状态。正确做法：浏览器登录后按 F12 → 网络 → 刷新页面 → 点该站请求 → 请求头 → 复制整条 `Cookie` 的值。粘贴时带了 `Cookie:` 前缀、外层引号、curl 的 `-H`/`--cookie`、BOM 或零宽字符等包裹也没关系，脚本会自动清洗掉
 - `NS_RANDOM`: 是否随机选择奖励，true/false（可选，默认 false）
 - `HEADLESS`: 是否使用无头模式，true/false（可选，默认 true）。**注意 GitHub Actions 中需用有头模式（`false`）配合 xvfb 才能通过 Cloudflare 挑战**，workflow 已硬编码为 `false`，本地无显示环境时可用 `true`
 - `NS_EXTRA_TASKS`: 除签到外的任务（评论、加鸡腿）总开关，true/false（可选，**默认 false**）
-- `DEEPFLOOD_COOKIE`: DeepFlood 子站的 Cookie（可选）。配置后会自动追加签到第二站；两站用同一套代码、同样页面结构，仅域名与 cookie 不同
+- `DEEPFLOOD_COOKIE`: DeepFlood 子站的 Cookie（可选）。配置后会自动追加签到第二站；两站用同一套代码、同样页面结构，仅域名与 cookie 不同。同样建议整段复制（含 `session`）
 - `LINUXSB_COOKIE`: linux.sb（烧饼社区）的 Cookie（可选）。配置后会在 NodeSeek / DeepFlood 之后追加签到一站（`linuxsb_daily.py`）。该站 2026-08 起会**间歇性**开启 Cloudflare 托管挑战（同一出口 IP 可能上一轮 403、下一轮 200），脚本会先用 requests 探测：能直连就走 requests 快通道，被挑战（HTTP 403 + `Cf-Mitigated: challenge`）则自动把 Cookie 注入浏览器过盾后签到。多账号用 `&` 分隔（`cookie1&cookie2`），依次签到、单账号失败不中断
 - `LINUXSB_ACCOUNT`: linux.sb 的账号密码兜底登录（可选），格式为 JSON：`{"username":"你的用户名","password":"你的密码"}`。**Cookie 优先**：`LINUXSB_COOKIE` 有效时完全不用凭据；Cookie 缺失或失效时自动用浏览器登录（算术题验证码由脚本解出填写，PoW 由页面 JS 计算），登录成功当场在同一浏览器会话内继续签到，无需手动换 cookie
 - `LINUXSB_FORCE_BROWSER`: 置 `1` 时 linux.sb 跳过 requests 探测直接走浏览器通道（可选）。用于站点长期开盾时省掉必然失败的探测，或在挑战未触发的时段验证浏览器通道
@@ -96,6 +96,8 @@ NodeSeek 每日任务
 顶部"任务开始时间"为脚本启动时刻，各站段首的"签到时间"为该站开始签到时刻，两者的差值即两站间的随机延迟。
 
 只配置单站时，通知只有【NodeSeek】一段，格式相同。
+
+签到前会先抓一次账号概览来确认登录态：只有确实登录（抓到等级/鸡腿等账号信息）时，"页面显示已签到"才会被判为成功。**判定只看页面证据，不依赖任何 cookie 名**——日志里出现的"cookie 串里没有 session 字段"只是排查线索，不是判据。抓不到概览时通知里会出现 `账号概览: 未抓到（未登录或页面结构已变化）`，此时签到结果一律如实报失败，不会静默报成功。
 
 ## 本地运行
 

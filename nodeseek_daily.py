@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import time
 import traceback
+import unicodedata
 import undetected_chromedriver as uc
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -54,6 +55,75 @@ def should_skip_cookie(name):
     return any(lowered.startswith(prefix) for prefix in SKIP_COOKIE_PREFIXES)
 
 
+# cookie 名称的合法字符集（RFC 6265 token），据此判断一段是否为新 cookie 的开头。
+# 放在模块级是因为解析与异常片段诊断都要用它。
+COOKIE_NAME_PATTERN = re.compile(r'^[A-Za-z0-9!#$%&\'*+\-.^_`|~]+$')
+COOKIE_NAME_CHAR_PATTERN = re.compile(r'[A-Za-z0-9!#$%&\'*+\-.^_`|~]')
+
+# curl 复制 cookie 时可能带上的参数名：-H 'Cookie: xxx' / --cookie "xxx" / -b xxx
+_COOKIE_FLAG_PREFIXES = ("-h", "--header", "--cookie", "-b")
+
+# 复制过程会混入的不可见字符：BOM、零宽空格、零宽非连接符/连接符。
+# cookie 名与值都限定在 ASCII token 内，这些字符只可能来自粘贴，直接清掉。
+_INVISIBLE_CHARS_PATTERN = re.compile('[\ufeff\u200b\u200c\u200d]')
+
+# 异常片段首个非法字符的类别提示，用于定位粘贴来源。只报字符类别，不报内容。
+_FRAGMENT_CHAR_HINTS = {
+    "Cf": "不可见格式字符（可能是 BOM 或零宽字符）",
+    "Pi": "引号",
+    "Pf": "引号",
+    "Po": "标点符号（可能是引号或冒号）",
+    "Zs": "空白字符",
+    "Pd": "连字符",
+    "Lo": "中文等表意文字（可能粘进了说明文字）",
+}
+
+
+def strip_cookie_wrappers(raw):
+    """
+    剥掉粘贴 cookie 时常见的包裹物，返回清洗后的 cookie 串。
+
+    覆盖：BOM、成对引号、`Cookie:` / `Set-Cookie:` 前缀、curl 的 -H/--cookie/-b 参数名。
+    这些包裹会让首个 cookie 名非法而被整条丢弃——如果丢的恰好是登录字段，
+    浏览器就会停在未登录状态，而页面上仍有"今日签到"入口文案，导致漏签被误报成已签到。
+    只做无歧义的剥离，不猜测缺失的 cookie 名。
+    """
+    text = _INVISIBLE_CHARS_PATTERN.sub('', raw).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+
+    for flag in _COOKIE_FLAG_PREFIXES:
+        lowered = text.lower()
+        if lowered.startswith(flag + " ") or lowered.startswith(flag + "="):
+            text = text[len(flag) + 1:].strip()
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+                text = text[1:-1].strip()
+            break
+
+    for prefix in ("set-cookie:", "cookie:"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    return text
+
+
+def describe_fragment(segment):
+    """
+    描述无法归属的开头片段的形状，用于定位粘贴问题，不输出片段内容。
+
+    只报告长度、是否含等号、首个非法字符的 Unicode 类别：
+    足以区分"被引号包住""带 BOM""粘进了说明文字"等情况，
+    同时保证 cookie 值不会出现在公开仓库的 CI 日志里。
+    """
+    detail = f"长度 {len(segment)}，" + ("含等号" if '=' in segment else "不含等号")
+    for char in segment.partition('=')[0].strip():
+        if not COOKIE_NAME_CHAR_PATTERN.match(char):
+            category = unicodedata.category(char)
+            detail += f"，首个非法字符：{_FRAGMENT_CHAR_HINTS.get(category, f'类别 {category}')}"
+            break
+    return detail
+
+
 def parse_cookie_string(raw):
     """
     解析 NS_COOKIE 字符串，返回 (待注入的 (name, value) 列表, 跳过原因列表)。
@@ -63,6 +133,8 @@ def parse_cookie_string(raw):
     因此逐段判断——某段不含 = 号或等号左侧不像合法 cookie 名时，
     视为上一个 cookie 值的延续并拼回去。
     同时把换行当作分隔符，便于 secret 多行粘贴。
+    进入切分前先交给 strip_cookie_wrappers 剥掉 BOM、引号、Cookie: 前缀、
+    curl 参数名等复制包裹，避免首个 cookie 因名字非法被整条丢弃。
 
     跳过原因中不含 cookie 值，可安全打印到 CI 日志。
     """
@@ -71,8 +143,9 @@ def parse_cookie_string(raw):
     if not raw:
         return pairs, skipped
 
-    # cookie 名称的合法字符集（RFC 6265 token），据此判断一段是否为新 cookie 的开头
-    name_pattern = re.compile(r'^[A-Za-z0-9!#$%&\'*+\-.^_`|~]+$')
+    # 先剥掉复制时常见的包裹（BOM、成对引号、Cookie: 前缀、curl 参数名）：
+    # 它们会让首个 cookie 名非法而被整条丢弃，正是漏签事故的可疑成因
+    raw = strip_cookie_wrappers(raw)
 
     for chunk in re.split(r'[;\r\n]+', raw):
         segment = chunk.strip()
@@ -80,7 +153,7 @@ def parse_cookie_string(raw):
             continue
 
         name, sep, value = segment.partition('=')
-        is_new_cookie = bool(sep) and bool(name_pattern.match(name.strip()))
+        is_new_cookie = bool(sep) and bool(COOKIE_NAME_PATTERN.match(name.strip()))
 
         if is_new_cookie:
             pairs.append([name.strip(), value.strip()])
@@ -88,8 +161,11 @@ def parse_cookie_string(raw):
             # 不像新 cookie，说明上一个 cookie 的值里含分号或换行，拼回去
             pairs[-1][1] = f"{pairs[-1][1]};{segment}"
         else:
-            # 开头就是异常片段，无法归属，只报告长度不输出内容
-            skipped.append(f"开头的异常片段（缺少合法 cookie 名），长度 {len(segment)}")
+            # 开头就是异常片段，无法归属；只报告形状，不输出内容
+            skipped.append(
+                f"开头的异常片段（{describe_fragment(segment)}）："
+                f"cookie 串可能被截断或带了未识别的包裹，请重新复制完整 cookie"
+            )
 
     result = []
     for name, value in pairs:
@@ -99,6 +175,18 @@ def parse_cookie_string(raw):
         result.append((name, value))
 
     return result, skipped
+
+
+def cookie_has_login(site):
+    """
+    提示性检查：站点 cookie 串里是否带登录态字段 session。
+
+    只用于给失败原因提供线索（session 是 HttpOnly cookie，只在浏览器发出的请求头里
+    可见，遗漏它是粘贴不完整最常见的形态），不参与判定——是否已登录一律以页面能否
+    抓到账号概览为准，避免把 cookie 名写死成判据。
+    """
+    pairs, _ = parse_cookie_string(site.cookie)
+    return any(name.strip().lower() == "session" for name, _ in pairs)
 
 
 def parse_chrome_major_version(version_output):
@@ -238,10 +326,20 @@ if SITE_GAP_MIN > SITE_GAP_MAX:
     SITE_GAP_MIN, SITE_GAP_MAX = SITE_GAP_MAX, SITE_GAP_MIN
 
 
-# 页面已签到的文案特征。命中任一说明今日已领取，属于正常结果而非失败。
-# 注意签到后页面实际显示"今日签到获得鸡腿x个"，靠"今日签到"+"获得...鸡腿"
-# 这类收益句判断；纯"已签到"等字眼是早期猜测，保留作兼容。
-SIGNED_MARKERS = ("今日签到", "今日已签到", "已经签到", "明天再来", "请明天", "已签到")
+# 页面已签到的收尾文案特征，只认"签到完成后才会出现"的措辞。
+# 不能再用「今日签到」「已签到」这类泛化词：签到页在未签到时同样会渲染这些入口
+# 文案，2026-09-30 实测——cookie 丢了 session 导致浏览器处于未登录态，按钮定位
+# 失败后正是被这些泛化词误判成"今日已签到"，两站整天静默漏签。
+# 收益句（"今日签到获得鸡腿x个"）另由下面的 SIGNED_REWARD_PATTERN 识别。
+SIGNED_MARKERS = ("明天再来", "明日再来", "请明天")
+
+# 已签到的收益句：把"签到"与"获得/领取/奖励"绑在同一句内，并要求收益带具体数字。
+# 另外排除"可获得/能获得"这类未然措辞，否则未签到页面上的
+# "每日签到可获得 5 个鸡腿"推广文案会被误判成"今日已签到"。
+SIGNED_REWARD_PATTERN = re.compile(
+    r'签到(?![^。；;]{0,6}(?:可|能|将|会))[^。；;]{0,6}(?:获得|领取|奖励)[^。；;]{0,12}\d+\s*个?\s*鸡腿'
+    r'|签到(?![^。；;]{0,6}(?:可|能|将|会))[^。；;]{0,6}(?:获得|领取|奖励)[^。；;]{0,12}鸡腿\s*\d+\s*个?'
+)
 
 
 def is_cloudflare_challenge(driver):
@@ -339,15 +437,30 @@ def fetch_account_summary(driver, site):
 
 def detect_already_signed(driver):
     """
-    判断签到页是否已显示"今日已签到"之类的文案。
-    用于区分"确实签过了"与"点击没生效"，避免后者被误报为成功。
+    判断签到页是否确实显示"今日已签到"，用于区分"确实签过了"与"点击没生效"。
+
+    判定口径必须严格：只认收尾文案（"明天再来"）或已完成的收益句
+    （"今日签到获得鸡腿x个"）。泛化的"今日签到""已签到"不算命中——未签到、甚至
+    未登录的页面同样会渲染签到入口文案，宽松匹配会把漏签静默掩盖成成功
+    （2026-09-30 事故：cookie 丢 session 未登录，两站都报"今日已签到"但都没签上）。
     """
     try:
         text = BeautifulSoup(driver.page_source, 'html.parser').get_text(' ', strip=True)
-        return any(marker in text for marker in SIGNED_MARKERS)
     except Exception as e:
         print(f"检测已签到状态失败: {str(e)}")
         return False
+
+    for marker in SIGNED_MARKERS:
+        if marker in text:
+            print(f"页面命中已签到收尾文案: {marker}", flush=True)
+            return True
+
+    match = SIGNED_REWARD_PATTERN.search(text)
+    if match:
+        print(f"页面命中已签到收益句: {match.group(0).strip()}", flush=True)
+        return True
+
+    return False
 
 
 def detect_login_required(driver):
@@ -373,13 +486,15 @@ def detect_login_required(driver):
         return False
 
 
-def click_sign_icon(driver, site):
+def click_sign_icon(driver, site, logged_in=True):
     """
     执行指定站点签到：直接打开签到页 /board 并领取奖励。
 
+    logged_in 为本站在签到前已确认登录态（抓到账号概览）的结果，默认 True 兼容旧调用。
+
     返回: {"success": bool, "detail": str}，detail 为通知用的中文结果描述。
-    只有确认领取成功或页面明确显示已签到才算成功；
-    既没领到又没有已签到标志时一律视为失败，避免掩盖真实问题。
+    只有确认领取成功、或在已确认登录态的前提下看到签到后才会出现的收尾文案，
+    才算成功；其余一律视为失败，避免掩盖真实问题。
     """
     try:
         print(f"[{site.name}] 正在打开签到页: {site.sign_url}", flush=True)
@@ -413,6 +528,17 @@ def click_sign_icon(driver, site):
         except Exception:
             # 找不到按钮，再核对是否为已签到状态
             print("未找到领取按钮，核对是否已签到...", flush=True)
+            if not logged_in:
+                # 未确认登录态时页面上的签到文案不可信：未登录页面同样会渲染
+                # "今日签到"这类入口文案（2026-09-30 漏签事故即由此而来），
+                # 只有确实登录并抓到账号信息才允许按"已签到"收尾。
+                # 通知里只给中性结论，具体线索（如缺 session）打在日志中
+                if not cookie_has_login(site):
+                    print("未确认登录态：cookie 串里没有 session 字段，粘贴大概率不完整", flush=True)
+                else:
+                    print("未确认登录态：cookie 可能已失效", flush=True)
+                return {"success": False,
+                        "detail": "签到失败: 未确认登录态（cookie 可能不完整或已失效），页面也没有领取按钮"}
             if detect_already_signed(driver):
                 print("页面显示今日已签到", flush=True)
                 return {"success": True, "detail": "今日已签到"}
@@ -443,6 +569,10 @@ def click_sign_icon(driver, site):
             return {"success": True, "detail": f"签到成功，{reward}"}
 
         if detect_already_signed(driver):
+            if not logged_in:
+                # 同上：登录态未确认时，页面收尾文案不足以证明签到成功
+                print("点击后出现已签到文案，但登录态未确认，不按成功收尾", flush=True)
+                return {"success": False, "detail": "签到失败: 登录态未确认，无法确认签到结果"}
             print("点击后页面显示已签到", flush=True)
             return {"success": True, "detail": "签到成功"}
 
@@ -553,9 +683,11 @@ def inject_site_cookies(driver, site):
             print(f"[{site.name}] 没有任何有效 cookie 被注入，请检查 cookie 格式（应形如 session=xxx）")
             return False
 
-        if not any(name.lower() == 'session' for name, _ in pairs):
-            # session 是登录态所在，缺失时后续必然停在未登录页面，提前点明原因
-            print(f"[{site.name}] 警告: 未注入名为 session 的 cookie，登录态很可能不完整")
+        if not cookie_has_login(site):
+            # 只作提示不参与判定：session 是 HttpOnly cookie，用 document.cookie
+            # 之类的方式复制必然漏掉它，是粘贴不完整最常见的形态
+            print(f"[{site.name}] 提示: cookie 串里没有 session 字段，登录态可能不完整；"
+                  f"session 是 HttpOnly cookie，需从浏览器「网络 → 该站请求 → 请求头 → Cookie」整段复制")
 
         print(f"[{site.name}] 刷新页面...", flush=True)
         driver.refresh()
@@ -709,6 +841,10 @@ def build_notify_content(site_results, task_started_at=None):
                 block.append(f"评论数: {account_summary['comment']}")
             if account_summary.get('topic'):
                 block.append(f"主题贴数: {account_summary['topic']}")
+        else:
+            # 抓不到账号概览说明登录态没确认上或页面结构变了，必须在通知里显形，
+            # 否则"看起来正常"的结果会掩盖登录态问题（2026-09-30 漏签事故）
+            block.append("账号概览: 未抓到（未登录或页面结构已变化）")
 
         # 附加任务被开关关闭时只说明状态，不输出无意义的 0/0 统计
         if comment_stats is None:
@@ -812,6 +948,18 @@ def run():
             site_results.append((site, {"success": False, "detail": "cookie 注入失败"}, None, {}, started_at))
             continue
 
+        # 先抓账号概览：它同时是"已登录"的证据，也是通知里的账号状态来源。
+        # 必须早于签到，因为未登录页面上同样会出现"今日签到"这类入口文案，
+        # 没有登录态就无法把"页面显示已签到"当成成功依据。
+        print(f"[{site.name}] 抓取账号概览并确认登录态...")
+        account_summary = fetch_account_summary(driver, site)
+        logged_in = bool(account_summary)
+        if not logged_in:
+            print(f"[{site.name}] 未抓到任何账号概览字段，登录态未确认", flush=True)
+            if not cookie_has_login(site):
+                print(f"[{site.name}] 线索: cookie 串里没有 session 字段（HttpOnly 项），"
+                      f"粘贴可能不完整；若确认已整段复制，则是 cookie 已失效需重新登录", flush=True)
+
         # 评论与加鸡腿受 NS_EXTRA_TASKS 控制，关闭时只执行签到
         if extra_tasks_enabled:
             print(f"[{site.name}] NS_EXTRA_TASKS 已开启，执行评论与加鸡腿任务")
@@ -820,11 +968,7 @@ def run():
             print(f"[{site.name}] NS_EXTRA_TASKS 未开启，仅执行签到")
             comment_stats = None
 
-        sign_result = click_sign_icon(driver, site)
-
-        # 签到完成后顺带抓取账号概览，失败时也能在通知里看到当前状态
-        print(f"[{site.name}] 抓取账号概览...")
-        account_summary = fetch_account_summary(driver, site)
+        sign_result = click_sign_icon(driver, site, logged_in=logged_in)
 
         site_results.append((site, sign_result, comment_stats, account_summary, started_at))
 
