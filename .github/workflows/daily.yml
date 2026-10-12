@@ -1,9 +1,6 @@
 name: NodeSeek 自动签到评论加鸡腿
 
 on:
-  push:
-    branches:
-      - main
   # 支持在 Actions 页面手动触发，便于验证配置是否生效
   workflow_dispatch:
     inputs:
